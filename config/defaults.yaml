@@ -1,0 +1,180 @@
+# Shared defaults for the bronze ingestion processor.
+# Every profile is deep-merged on top of this file, so a profile only needs to
+# override what differs. Anything here can be overridden per profile.
+
+# ---------------------------------------------------------------------------
+# Control / audit storage (Delta tables that drive incremental loading + logs)
+# ---------------------------------------------------------------------------
+control:
+  database: control
+  # Base location for the control database tables. Leave null to use the
+  # Spark warehouse default; set to an ADLS path to keep them in the lake.
+  base_path: null
+  ingestion_log_table: bronze_ingestion_log   # one row per file processed
+  run_log_table: bronze_run_log               # one row per notebook run
+  column_profile_table: bronze_column_profile # one row per column per load
+
+# ---------------------------------------------------------------------------
+# Source read defaults (per-format). Profiles override source.options.
+# ---------------------------------------------------------------------------
+source:
+  file_readiness:
+    enabled: false            # OPTIONAL and OFF by default
+    success_marker: null      # e.g. "_SUCCESS"; null disables the marker check
+    min_file_age_minutes: 0   # 0 disables the mtime-stability check
+  # OPTIONAL path tokens: a template with {token} placeholders matched against
+  # each file's full path. Every {token} becomes a column "_token_<token>" in
+  # the bronze table, populated from the matching part of the path.
+  #   e.g. path_template: "abs/exports/data_{extract_date}/current.csv"
+  #        file abs/exports/data_january_2025/current.csv -> _token_extract_date = "january_2025"
+  path_template: null
+  token_pattern: "[^/]+"      # regex each {token} matches (default: one path segment chunk)
+  options:
+    sep: ","
+    header: true
+    encoding: "UTF-8"
+    quote: '"'
+    escape: '"'
+    multiLine: false          # keep false for splittability of large text files
+    comment: null
+
+# ---------------------------------------------------------------------------
+# Parsing / typing defaults
+# ---------------------------------------------------------------------------
+parsing:
+  null_values: ["", "NULL", "null", "N/A", "n/a", "\\N"]
+  decimal_sep: "."
+  thousands_sep: null         # e.g. "," to strip thousands separators before cast
+  date_format: "yyyy-MM-dd"
+  timestamp_format: "yyyy-MM-dd HH:mm:ss"
+  validate_headers: true      # name-based header drift detection (log/flag only)
+
+# ---------------------------------------------------------------------------
+# String sanitisation (applied to every string column before typing)
+# ---------------------------------------------------------------------------
+sanitisation:
+  enabled: true
+  strip_control_chars: true   # remove non-printable / control chars
+  normalise_whitespace: true  # collapse runs of whitespace to a single space + trim
+  strip_bom: true             # strip UTF-8 / UTF-16 byte-order marks
+  remove_chars: []            # explicit characters to strip, e.g. ["\u0000"]
+
+# ---------------------------------------------------------------------------
+# Data quality gates
+# ---------------------------------------------------------------------------
+quality:
+  max_quarantine_pct: 25            # circuit-breaker: fail the batch if exceeded
+  # How to handle source columns that are not in the declared schema:
+  #   extra_cols_map - capture unexpected columns into a JSON "_bronze_extra_cols"
+  #                    column (added to bronze; missing declared cols become null)
+  #   merge_schema   - let Delta widen the bronze table with the new columns
+  #   fail           - abort the run when extra or missing columns are detected
+  schema_evolution: extra_cols_map  # extra_cols_map | merge_schema | fail
+  max_attempts: 3                   # after this many failed loads a file is parked
+                                    # as dead_letter and no longer retried
+  dedup:
+    on_change_key: false            # drop in-batch duplicates by _change_key
+  reconciliation:
+    enabled: false
+    trailer_record_count_regex: null
+
+# ---------------------------------------------------------------------------
+# Per-load column profiling (written to control.<column_profile_table>).
+# One row per loaded column per run: null %, distinct count, min/max - the raw
+# material for trend lines and anomaly detection downstream.
+# ---------------------------------------------------------------------------
+profiling:
+  enabled: true
+  approx_distinct: true     # approx_count_distinct (cheap) vs exact countDistinct
+  include_min_max: true     # capture min/max (stored as strings)
+  columns: null             # null = all schema columns; or a list of column names
+
+# ---------------------------------------------------------------------------
+# Target Delta defaults
+# ---------------------------------------------------------------------------
+target:
+  database: bronze
+  write_mode: append
+  partition_by: ["_bronze_load_date"]
+  optimize_write: true
+  auto_compact: true
+  idempotent_writes: true       # delete any existing rows for this batch_id before
+                                # appending, so pipeline retries don't duplicate rows
+
+# ---------------------------------------------------------------------------
+# Dedicated SQL pool publish (Synapse Dedicated SQL Pool Connector for Spark)
+# Loads bronze rows into a dedicated pool table via COPY + MSI staging.
+# No external tables, no serverless. Used by notebooks/bronze_publish.py.
+# ---------------------------------------------------------------------------
+sql_pool:
+  enabled: false
+  server: null              # null = dedicated pool in THIS workspace (auto-detected).
+                            # Set "<workspace>.sql.azuresynapse.net" for cross-workspace.
+  database: null            # dedicated SQL pool (database) name
+  schema: bronze
+  table: null               # defaults to target.table when null
+  temp_folder: null         # abfss:// staging folder for the COPY load (required)
+  mode: append              # append | overwrite
+  idempotent: false         # delete this batch's rows in the pool before append
+                            # (pipeline-retry safe). Requires `server` (the SQL
+                            # endpoint) and the workspace MSI to have DELETE rights.
+  # Project the bronze columns to the dedicated-pool table shape. Internal
+  # lineage columns are dropped, and underscore-prefixed columns renamed so the
+  # SQL pool gets clean names. Must match the pre-created table DDL.
+  # _bronze_extra_cols stays in the bronze Delta table but is not published to
+  # the dedicated SQL pool.
+  drop_columns: ["_bronze_run_id", "_bronze_processor_version", "_bronze_extra_cols"]
+  rename: {}                    # pool columns mirror the bronze _bronze_* names
+  # Used by notebooks/generate_pool_ddl.py to emit CREATE TABLE statements.
+  default_string_length: 4000   # NVARCHAR length for string cols without sql_length
+  max_string_length: 4000       # bound used when a column sets sql_length: max
+                                # (dedicated SQL pool caps NVARCHAR at 4000; no MAX)
+  token_string_length: 256      # NVARCHAR length for _token_* path-token columns
+  distribution: ROUND_ROBIN     # ROUND_ROBIN | HASH | REPLICATE
+  hash_column: null             # required when distribution = HASH
+  index: "CLUSTERED COLUMNSTORE INDEX"   # or "HEAP"
+
+# ---------------------------------------------------------------------------
+# Publish run metrics + column profiles to the dedicated SQL pool.
+# Reuses the sql_pool connection (server / database / temp_folder). Used by
+# notebooks/publish_metrics.py so analysts/dbt can trend and alert on loads.
+# ---------------------------------------------------------------------------
+metrics_publish:
+  enabled: false
+  database: null            # dedicated pool DB; null = reuse sql_pool.database
+  schema: operations        # pool schema for the metrics tables
+  run_log_table: bronze_run_log
+  column_profile_table: bronze_column_profile
+  mode: append              # append | overwrite
+  idempotent: false         # delete this run's/batch's metrics before append
+                            # (needs sql_pool.server + MSI DELETE rights)
+
+# ---------------------------------------------------------------------------
+# dbt artifact generation (used by notebooks/generate_dbt_artifacts.py)
+# ---------------------------------------------------------------------------
+dbt:
+  enabled: true
+  source_name: bronze       # dbt source name, e.g. source('bronze', 'crm_customer')
+  source_description: "Bronze tables loaded from Synapse Spark profiles."
+  staging_model_prefix: stg_
+  staging_materialized: view
+  include_column_data_types: true
+  include_not_null_tests: true
+  include_change_key_test: false
+  output_root: null         # optional abfss:// output folder for generated dbt files
+
+# ---------------------------------------------------------------------------
+# Spark session tuning applied at runtime
+# ---------------------------------------------------------------------------
+spark_conf:
+  spark.sql.session.timeZone: "UTC"                 # so load timestamps are true UTC
+  spark.sql.files.maxPartitionBytes: "134217728"    # 128 MB; lower to fan out big files
+  # CORRECTED returns null (-> quarantine) for unparseable dates/times instead of
+  # throwing and failing the whole batch (EXCEPTION). Use LEGACY only if you rely
+  # on pre-Spark-3 lenient parsing.
+  spark.sql.legacy.timeParserPolicy: "CORRECTED"
+  # NOTE: optimized write + auto-compact are enabled via OSS Delta TABLE
+  # PROPERTIES set in write_bronze (delta.autoOptimize.optimizeWrite /
+  # delta.autoOptimize.autoCompact). These are respected by Delta Lake 3.2
+  # regardless of runtime, so we deliberately do NOT set a session-level
+  # optimizeWrite key here (that key name varies across Synapse runtimes).

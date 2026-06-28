@@ -1,0 +1,23 @@
+{
+  "name": "DS_BronzeProfilesFolder",
+  "properties": {
+    "description": "Folder dataset over the bronze profiles directory in ADLS Gen2. Used by a Get Metadata activity to auto-discover profile YAML files.",
+    "linkedServiceName": {
+      "referenceName": "LS_ADLS_Bronze",
+      "type": "LinkedServiceReference"
+    },
+    "parameters": {
+      "fileSystem": { "type": "string" },
+      "folderPath": { "type": "string" }
+    },
+    "type": "Binary",
+    "typeProperties": {
+      "location": {
+        "type": "AzureBlobFSLocation",
+        "fileSystem": { "value": "@dataset().fileSystem", "type": "Expression" },
+        "folderPath": { "value": "@dataset().folderPath", "type": "Expression" }
+      }
+    },
+    "annotations": [ "bronze" ]
+  }
+}

@@ -1,0 +1,352 @@
+{
+  "name": "PL_Bronze_Daily",
+  "properties": {
+    "description": "Daily metadata-driven bronze load. Auto-discovers every profile *.yaml in an ADLS Gen2 folder, then for each profile ingests landing files into the bronze Delta table, publishes the batch to the dedicated SQL pool, and publishes run metrics + column profiles. Idempotent, so a retried run never duplicates data.",
+    "concurrency": 1,
+    "activities": [
+      {
+        "name": "ListProfiles",
+        "type": "GetMetadata",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "0.00:30:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 30,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "dataset": {
+            "referenceName": "DS_BronzeProfilesFolder",
+            "type": "DatasetReference",
+            "parameters": {
+              "fileSystem": {
+                "value": "@pipeline().parameters.profilesFileSystem",
+                "type": "Expression"
+              },
+              "folderPath": {
+                "value": "@pipeline().parameters.profilesFolderPath",
+                "type": "Expression"
+              }
+            }
+          },
+          "fieldList": [ "childItems" ],
+          "storeSettings": {
+            "type": "AzureBlobFSReadSettings",
+            "enablePartitionDiscovery": false
+          },
+          "formatSettings": {
+            "type": "BinaryReadSettings"
+          }
+        }
+      },
+      {
+        "name": "FilterYaml",
+        "type": "Filter",
+        "dependsOn": [
+          {
+            "activity": "ListProfiles",
+            "dependencyConditions": [ "Succeeded" ]
+          }
+        ],
+        "typeProperties": {
+          "items": {
+            "value": "@activity('ListProfiles').output.childItems",
+            "type": "Expression"
+          },
+          "condition": {
+            "value": "@and(and(equals(item().type, 'File'), or(endswith(toLower(item().name), '.yaml'), endswith(toLower(item().name), '.yml'))), or(empty(pipeline().parameters.profileFilter), contains(pipeline().parameters.profileFilter, replace(replace(item().name, '.yaml', ''), '.yml', ''))))",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "ValidateProfilesFound",
+        "type": "IfCondition",
+        "dependsOn": [
+          {
+            "activity": "FilterYaml",
+            "dependencyConditions": [ "Succeeded" ]
+          }
+        ],
+        "typeProperties": {
+          "expression": {
+            "value": "@and(pipeline().parameters.failIfNoProfiles, equals(length(activity('FilterYaml').output.value), 0))",
+            "type": "Expression"
+          },
+          "ifTrueActivities": [
+            {
+              "name": "FailNoProfiles",
+              "type": "Fail",
+              "dependsOn": [],
+              "typeProperties": {
+                "message": {
+                  "value": "@concat('No profile YAML files discovered in ', pipeline().parameters.profilesFileSystem, '/', pipeline().parameters.profilesFolderPath, ' (after applying profileFilter ', string(pipeline().parameters.profileFilter), '). Check the folder path, the linked service permissions, and the filter.')",
+                  "type": "Expression"
+                },
+                "errorCode": "NO_PROFILES_DISCOVERED"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "ForEachProfile",
+        "type": "ForEach",
+        "dependsOn": [
+          {
+            "activity": "ValidateProfilesFound",
+            "dependencyConditions": [ "Succeeded" ]
+          }
+        ],
+        "typeProperties": {
+          "items": {
+            "value": "@activity('FilterYaml').output.value",
+            "type": "Expression"
+          },
+          "isSequential": false,
+          "batchCount": 4,
+          "activities": [
+            {
+              "name": "IngestStage",
+              "type": "IfCondition",
+              "dependsOn": [],
+              "typeProperties": {
+                "expression": {
+                  "value": "@pipeline().parameters.runIngest",
+                  "type": "Expression"
+                },
+                "ifTrueActivities": [
+                  {
+                    "name": "Ingest",
+                    "type": "SynapseNotebook",
+                    "dependsOn": [],
+                    "policy": {
+                      "timeout": "0.12:00:00",
+                      "retry": 1,
+                      "retryIntervalInSeconds": 120,
+                      "secureOutput": false,
+                      "secureInput": false
+                    },
+                    "userProperties": [
+                      {
+                        "name": "profile",
+                        "value": "@replace(replace(item().name, '.yaml', ''), '.yml', '')"
+                      }
+                    ],
+                    "typeProperties": {
+                      "notebook": {
+                        "referenceName": "bronze_ingest",
+                        "type": "NotebookReference"
+                      },
+                      "parameters": {
+                        "profile_name": {
+                          "value": { "value": "@replace(replace(item().name, '.yaml', ''), '.yml', '')", "type": "Expression" },
+                          "type": "string"
+                        },
+                        "config_root": {
+                          "value": { "value": "@pipeline().parameters.configRoot", "type": "Expression" },
+                          "type": "string"
+                        },
+                        "batch_id": {
+                          "value": { "value": "@if(empty(pipeline().parameters.batchIdOverride), pipeline().RunId, pipeline().parameters.batchIdOverride)", "type": "Expression" },
+                          "type": "string"
+                        },
+                        "run_id": {
+                          "value": { "value": "@if(empty(pipeline().parameters.batchIdOverride), pipeline().RunId, pipeline().parameters.batchIdOverride)", "type": "Expression" },
+                          "type": "string"
+                        },
+                        "log_level": {
+                          "value": { "value": "@pipeline().parameters.logLevel", "type": "Expression" },
+                          "type": "string"
+                        }
+                      },
+                      "snapshot": true,
+                      "sparkPool": {
+                        "referenceName": "SET_YOUR_SPARK_POOL_NAME",
+                        "type": "BigDataPoolReference"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "name": "PublishStage",
+              "type": "IfCondition",
+              "dependsOn": [
+                {
+                  "activity": "IngestStage",
+                  "dependencyConditions": [ "Succeeded" ]
+                }
+              ],
+              "typeProperties": {
+                "expression": {
+                  "value": "@pipeline().parameters.runPublish",
+                  "type": "Expression"
+                },
+                "ifTrueActivities": [
+                  {
+                    "name": "Publish",
+                    "type": "SynapseNotebook",
+                    "dependsOn": [],
+                    "policy": {
+                      "timeout": "0.12:00:00",
+                      "retry": 1,
+                      "retryIntervalInSeconds": 120,
+                      "secureOutput": false,
+                      "secureInput": false
+                    },
+                    "userProperties": [
+                      {
+                        "name": "profile",
+                        "value": "@replace(replace(item().name, '.yaml', ''), '.yml', '')"
+                      }
+                    ],
+                    "typeProperties": {
+                      "notebook": {
+                        "referenceName": "bronze_publish",
+                        "type": "NotebookReference"
+                      },
+                      "parameters": {
+                        "profile_name": {
+                          "value": { "value": "@replace(replace(item().name, '.yaml', ''), '.yml', '')", "type": "Expression" },
+                          "type": "string"
+                        },
+                        "config_root": {
+                          "value": { "value": "@pipeline().parameters.configRoot", "type": "Expression" },
+                          "type": "string"
+                        },
+                        "batch_id": {
+                          "value": { "value": "@if(empty(pipeline().parameters.batchIdOverride), pipeline().RunId, pipeline().parameters.batchIdOverride)", "type": "Expression" },
+                          "type": "string"
+                        },
+                        "log_level": {
+                          "value": { "value": "@pipeline().parameters.logLevel", "type": "Expression" },
+                          "type": "string"
+                        }
+                      },
+                      "snapshot": true,
+                      "sparkPool": {
+                        "referenceName": "SET_YOUR_SPARK_POOL_NAME",
+                        "type": "BigDataPoolReference"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "name": "PublishMetricsStage",
+              "type": "IfCondition",
+              "dependsOn": [
+                {
+                  "activity": "PublishStage",
+                  "dependencyConditions": [ "Succeeded" ]
+                }
+              ],
+              "typeProperties": {
+                "expression": {
+                  "value": "@pipeline().parameters.runPublishMetrics",
+                  "type": "Expression"
+                },
+                "ifTrueActivities": [
+                  {
+                    "name": "PublishMetrics",
+                    "type": "SynapseNotebook",
+                    "dependsOn": [],
+                    "policy": {
+                      "timeout": "0.06:00:00",
+                      "retry": 1,
+                      "retryIntervalInSeconds": 120,
+                      "secureOutput": false,
+                      "secureInput": false
+                    },
+                    "userProperties": [
+                      {
+                        "name": "profile",
+                        "value": "@replace(replace(item().name, '.yaml', ''), '.yml', '')"
+                      }
+                    ],
+                    "typeProperties": {
+                      "notebook": {
+                        "referenceName": "publish_metrics",
+                        "type": "NotebookReference"
+                      },
+                      "parameters": {
+                        "profile_name": {
+                          "value": { "value": "@replace(replace(item().name, '.yaml', ''), '.yml', '')", "type": "Expression" },
+                          "type": "string"
+                        },
+                        "config_root": {
+                          "value": { "value": "@pipeline().parameters.configRoot", "type": "Expression" },
+                          "type": "string"
+                        },
+                        "run_id": {
+                          "value": { "value": "@if(empty(pipeline().parameters.batchIdOverride), pipeline().RunId, pipeline().parameters.batchIdOverride)", "type": "Expression" },
+                          "type": "string"
+                        },
+                        "log_level": {
+                          "value": { "value": "@pipeline().parameters.logLevel", "type": "Expression" },
+                          "type": "string"
+                        }
+                      },
+                      "snapshot": true,
+                      "sparkPool": {
+                        "referenceName": "SET_YOUR_SPARK_POOL_NAME",
+                        "type": "BigDataPoolReference"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "parameters": {
+      "runIngest": {
+        "type": "bool",
+        "defaultValue": true
+      },
+      "runPublish": {
+        "type": "bool",
+        "defaultValue": true
+      },
+      "runPublishMetrics": {
+        "type": "bool",
+        "defaultValue": true
+      },
+      "batchIdOverride": {
+        "type": "string",
+        "defaultValue": ""
+      },
+      "profileFilter": {
+        "type": "array",
+        "defaultValue": []
+      },
+      "failIfNoProfiles": {
+        "type": "bool",
+        "defaultValue": true
+      },
+      "profilesFileSystem": {
+        "type": "string",
+        "defaultValue": "config"
+      },
+      "profilesFolderPath": {
+        "type": "string",
+        "defaultValue": "bronze/profiles"
+      },
+      "configRoot": {
+        "type": "string",
+        "defaultValue": "abfss://config@SET_YOUR_ACCOUNT.dfs.core.windows.net/bronze"
+      },
+      "logLevel": {
+        "type": "string",
+        "defaultValue": "INFO"
+      }
+    },
+    "annotations": [ "bronze", "ingestion" ]
+  }
+}
