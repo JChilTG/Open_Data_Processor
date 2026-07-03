@@ -1,0 +1,15 @@
+version: 2
+
+sources:
+  - name: country_raw
+    description: >
+      Raw country inputs. Point database/schema at your Synapse environment.
+    # database: your_database   # uncomment/set for your dedicated SQL pool
+    schema: dbo
+    tables:
+      - name: market_table
+        description: Canonical country list. Fields - iso2, iso3, name.
+      - name: source_as
+        description: Source AS. Provides a country `name` only (wording may differ from canonical).
+      - name: source_af
+        description: Source AF. Provides an `iso2` code (may differ from canonical iso2).

@@ -12,11 +12,133 @@ project.
 synapse/
   macros/hash_all_except.sql              chunked HASHBYTES hash (scales past 254 cols)
   macros/create_statistics.sql            idempotent CREATE STATISTICS (post-hook)
+  macros/country_crosswalk.sql            resolve a source value to canonical ISO3
+  seeds/country_overrides.csv             manual mapping + canonical-name overrides
+  models/country/                         dim_country + AS/AF bridges + sources/tests
   models/staging/stg_..._core.sql         typed/cleaned columns (view)
   models/staging/stg_..._snapshots.sql    adds attribute_hash via the macro (view)
-  models/marts/dim_account_scd2.sql       SCD2 dimension (REPLICATE table)
-  tests/                                  singular tests, adapted for BIT/T-SQL
+  models/marts/dim_account_scd1.sql            SCD1 built from raw snapshots
+  models/marts/dim_account_scd1_from_scd2.sql  SCD1 derived from the SCD2 table (template)
+  models/marts/dim_account_scd2.sql            SCD2 dimension (concrete example)
+  models/marts/dim_scd2_template.sql           SCD2 template (full daily snapshots)
+  models/marts/dim_scd2_delta_template.sql     SCD2 template (CDC / delta append)
+  tests/                                       singular tests, adapted for BIT/T-SQL
 ```
+
+### Snapshot vs delta SCD2 templates
+
+Pick the template that matches how your source lands:
+
+| | `dim_scd2_template` | `dim_scd2_delta_template` |
+|---|---|---|
+| Source | full daily snapshot (every key, every day) | append of only changed rows (CDC) |
+| Version boundary | hash differs from previous day | every appended delta row |
+| Deletes | inferred from absence in latest snapshot | explicit delete/operation flag |
+| Grain | day | `day` or `timestamp` |
+| No-op handling | inherent (hash comparison) | optional hash collapse |
+
+The delta template supports both day and timestamp effective-dating, an optional
+`delete_flag_column` (a delete delta becomes the latest version with
+`is_deleted = 1`), an optional `hash_column` to collapse unchanged deltas, and an
+optional `tiebreak_column` to dedupe multiple rows per key+date. Configure it via
+its "Template configuration" block; a deleted key's active state is
+`is_current = 1 and is_deleted = 0`.
+
+### Reusable SCD2 template
+
+`dim_scd2_template.sql` is the generic form of `dim_account_scd2`. To build an
+SCD2 for a new entity, copy it, rename the file, and edit only the "Template
+configuration" block:
+
+```jinja
+{%- set source_relation = ref('stg_d365_account_snapshots') -%}
+{%- set natural_key = 'account_id' -%}
+{%- set snapshot_date_column = 'snapshot_date' -%}
+{%- set hash_column = 'attribute_hash' -%}
+{%- set surrogate_key_name = 'account_sk' -%}
+{%- set high_date = "cast('9999-12-31' as date)" -%}
+```
+
+Every CTE (partition, joins, effective-dating, surrogate key) is driven by those
+values, and business columns are discovered at build time, so the template
+survives source schema changes.
+
+### Two ways to get SCD1
+
+- `dim_account_scd1` rebuilds current-state directly from the daily snapshots.
+- `dim_account_scd1_from_scd2` **collapses the SCD2 table** by keeping
+  `is_current = 1` and dropping the SCD2 framework columns. It's cheaper and
+  guaranteed consistent with the SCD2 history. Deleted accounts have
+  `is_current = 0` in SCD2, so they are naturally excluded. It is written as a
+  reusable template — change the four values in its "Template configuration"
+  block (source relation, natural key, surrogate key name, framework columns) to
+  reuse it for any SCD2 dimension.
+
+## SCD1 vs SCD2
+
+Both build from the same daily snapshots and share the Synapse conventions and
+graceful schema-evolution approach.
+
+| | `dim_account_scd1` | `dim_account_scd2` |
+|---|---|---|
+| Grain | one row per account (latest) | one row per account *per version* |
+| History | overwrite, none kept | full, via `effective_from/to_date` |
+| Key | `account_sk` = hash(account_id) | `account_sk` = hash(account_id + effective_from_date) |
+| Deletes | `is_deleted` BIT flag (soft) | version closed on last-seen date |
+| Current row | every row (filter `is_deleted = 0`) | `is_current = 1` |
+
+SCD1 selects the latest snapshot per key with `ROW_NUMBER() ... WHERE _rn = 1`
+(Synapse has no `QUALIFY`). For a current-and-active-only table, filter
+`where is_deleted = 0`, or hard-delete by restricting to accounts present in the
+latest extract.
+
+## Country mapping (canonical + source crosswalks)
+
+Maps disparate country sources onto a canonical list (`market_table`: iso2, iso3,
+name) with a user-controlled override seed.
+
+```
+market_table ─► dim_country ◄─ country_overrides (canonical_name overrides)
+                    ▲
+country_overrides (source_map) ─┐
+source_as (name) ───────────────┼─► bridge_country_as  (name  -> canonical iso3)
+source_af (iso2) ───────────────┴─► bridge_country_af  (iso2  -> canonical iso3)
+```
+
+- `dim_country` applies `canonical_name` overrides on top of `market_table`.
+- `bridge_country_as` / `bridge_country_af` call the `country_crosswalk` macro to
+  resolve each source value **override first, then automatic match**, leaving
+  `canonical_iso3` NULL (`match_type = 'unmatched'`) when nothing matches so gaps
+  are visible.
+- Matching is case/whitespace-insensitive and uses `COLLATE DATABASE_DEFAULT`
+  everywhere to avoid seed-vs-source collation conflicts.
+
+### The override seed (`country_overrides.csv`)
+
+One seed, two modes via `override_type`:
+
+| override_type | Purpose | Columns used |
+|---------------|---------|--------------|
+| `source_map` | map a source value to a canonical code | `source_system`, `match_field` (`name`/`iso2`/`iso3`), `source_value`, `canonical_iso3` |
+| `canonical_name` | override a canonical code's display name | `canonical_iso3`, `canonical_name` |
+
+```csv
+override_type,source_system,match_field,source_value,canonical_iso3,canonical_name
+source_map,AS,name,South Korea,KOR,
+source_map,AF,iso2,UK,GBR,
+canonical_name,,,,TUR,Turkey
+```
+
+### Reuse for another source
+
+Add a source to `_country_sources.yml`, then create a one-line bridge:
+
+```sql
+{{ country_crosswalk(source('country_raw','source_xx'), 'XX', 'iso3', 'country_code') }}
+```
+
+Point `_country_sources.yml` at your database/schema before running:
+`dbt seed && dbt run --select dim_country bridge_country_as bridge_country_af`.
 
 ## create_statistics
 

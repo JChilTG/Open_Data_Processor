@@ -1,0 +1,24 @@
+version: 2
+
+seeds:
+  - name: country_overrides
+    description: >
+      Manual country mapping overrides. Two modes via override_type:
+        - 'source_map': map a source value (name/iso2/iso3) to a canonical ISO3.
+          Uses source_system, match_field, source_value, canonical_iso3.
+        - 'canonical_name': override the display name of a canonical code.
+          Uses canonical_iso3, canonical_name.
+    columns:
+      - name: override_type
+        description: "'source_map' or 'canonical_name'."
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['source_map', 'canonical_name']
+      - name: match_field
+        description: "For source_map: 'name', 'iso2', or 'iso3'."
+      - name: canonical_iso3
+        description: Target canonical ISO3 code (required for both modes).
+        tests:
+          - not_null

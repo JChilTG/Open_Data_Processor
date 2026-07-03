@@ -1,0 +1,40 @@
+version: 2
+
+models:
+  - name: dim_country
+    description: Canonical country dimension (iso2, iso3, name) with name overrides applied.
+    columns:
+      - name: country_sk
+        tests: [unique, not_null]
+      - name: iso3
+        tests: [unique, not_null]
+      - name: iso2
+        tests: [unique]
+      - name: name
+        tests: [not_null]
+
+  - name: bridge_country_as
+    description: Crosswalk of Source AS names to canonical ISO3 (override then auto match).
+    columns:
+      - name: source_value
+        tests: [not_null]
+      - name: canonical_iso3
+        description: NULL when unmatched (needs an override).
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_country')
+                field: iso3
+
+  - name: bridge_country_af
+    description: Crosswalk of Source AF iso2 codes to canonical ISO3 (override then auto match).
+    columns:
+      - name: source_value
+        tests: [not_null]
+      - name: canonical_iso3
+        description: NULL when unmatched (needs an override).
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_country')
+                field: iso3
