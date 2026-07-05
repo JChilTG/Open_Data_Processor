@@ -9,14 +9,16 @@
 #   profile file in an ADLS Gen2 container named "metadata" (see
 #   METADATA_CONTAINER_PATH below, and table_profiles/*.yaml alongside this
 #   script for examples). For each profile: reads the Delta table from ADLS
-#   Gen2, works out which rows are not yet present in the corresponding
-#   Dedicated SQL Pool table (optionally narrowed first with a watermark
-#   column for speed), stages only those candidate rows into the pool, then
-#   performs a single set-based `INSERT ... SELECT ... WHERE NOT EXISTS` so
-#   the pool itself - not Spark - does the authoritative de-dup. This is the
-#   pattern that plays best with Dedicated SQL Pool's MPP engine (stage, then
-#   push a set-based transform), rather than pulling target keys into Spark
-#   for an anti-join.
+#   Gen2, filters it to rows whose watermark_column is greater than
+#   MAX(watermark_column) already in the target - no business key or
+#   NOT EXISTS/anti-join check involved, "already loaded" is decided purely
+#   by the watermark cursor - stages those rows, then commits them with a
+#   single set-based `INSERT ... SELECT` (staging is still used even though
+#   there's no de-dup predicate to push down: it's what makes the commit into
+#   the pool retry-safe - see load_target_table_fresh/load_staging_table).
+#   watermark_column defaults to "_bronze_loaded_at_utc_ts" (a bronze-layer
+#   ingestion timestamp, stamped once per load batch) if a profile doesn't
+#   specify one.
 #
 # DESIGN NOTES / DEDICATED SQL POOL QUIRKS THIS WORKS AROUND
 #   - The Spark connector for Dedicated SQL Pool (com.microsoft.spark.
@@ -43,6 +45,15 @@
 #     the same explicit way each run too, by mirroring the target's *actual*
 #     column types straight from INFORMATION_SCHEMA - so staging can never
 #     drift from (or truncate relative to) the real target schema.
+#   - HEAP/CLUSTERED INDEX tables (unlike CLUSTERED COLUMNSTORE INDEX) are
+#     subject to Dedicated SQL Pool's classic 8,060-byte max row size. Since
+#     every string column defaults to NVARCHAR(4000) (8,000 bytes) to avoid
+#     silent truncation, a "small" table with just two or three such columns
+#     can blow past that on its own. estimate_heap_row_bytes sizes this up
+#     before deciding HEAP vs. columnstore, and forces columnstore (which
+#     isn't subject to the limit) even under SMALL_TABLE_ROW_THRESHOLD when
+#     HEAP would exceed it - an explicit table_structure: HEAP is still
+#     honored, but with a logged warning if it looks like it'll fail.
 #   - Schema drift between the Delta source and the target table is handled,
 #     not treated as an error: a column the source has gained is added to the
 #     target with `ALTER TABLE ... ADD <col> <type> NULL` (always nullable,
@@ -56,14 +67,24 @@
 #   - Dedicated SQL Pool has no reliable way to auto-increment/serialize
 #     concurrent loads, and small SKUs (e.g. DW100c) have very few concurrent
 #     query slots - tables are processed sequentially by default.
-#   - NULL business keys break naive `t.key = s.key` joins (NULL <> NULL in
-#     T-SQL), so the NOT EXISTS predicate is NULL-safe per key column.
-#   - The NOT EXISTS check only guards against rows already in the *target*;
-#     it says nothing about two rows sharing a key within the same source
-#     read (a late correction, an upstream retry). Left alone that produces
-#     a duplicate in the target, so every candidate batch is de-duplicated
-#     on key_columns before staging (deduplicate_candidates - keeps the
-#     highest watermark_column value per key when one is configured).
+#   - watermark_column is load-bearing, not a performance nicety: it's the
+#     only signal used to decide "already loaded". It's validated as present
+#     in the source before anything else runs. If the source ever stops
+#     producing it, the load fails loudly instead of silently going quiet
+#     (which is what would happen if it were merely NULL-filled like any
+#     other dropped column - see align_to_target_columns).
+#   - Because there's no per-row identity check, this scheme assumes the
+#     source's watermark_column is assigned once, atomically, per ingestion
+#     batch, and never changes afterward. If a batch's rows only partially
+#     land in the target (a failure mid-write) before this script's own
+#     retry-safe staging path was in place, rows sharing that exact
+#     watermark value would not be revisited on the next run, since the
+#     filter is a strict `>` against the batch's own watermark value. Keep
+#     batches atomic on the source side (all-or-nothing per
+#     watermark_column value) for this to hold.
+#   - FULL_REFRESH now TRUNCATEs the target before reloading everything: with
+#     no business key to de-duplicate against, blindly re-staging the whole
+#     source on top of an already-loaded target would just double every row.
 #   - Retries are not applied blindly: permission/object/syntax errors (SQL
 #     error numbers in NON_RETRYABLE_SQL_ERROR_CODES) fail immediately rather
 #     than burning ~70s of backoff on something that can't succeed on retry.
@@ -131,9 +152,11 @@ STAGING_STORAGE_LINKED_SERVICE = "<staging-storage-linked-service-name>"
 STAGING_SCHEMA = None
 STAGING_TABLE_SUFFIX = "_stg_load"
 
-# Set True to ignore watermark columns and re-evaluate every source row
-# against the target with the NOT EXISTS check (useful for backfills /
-# recovering from a gap). Normal daily runs should leave this False.
+# Set True to TRUNCATE each target table and reload its entire source,
+# ignoring the watermark cursor (for backfills / recovering from a gap).
+# There is no business-key de-dup to fall back on here, so this always wipes
+# the target first rather than re-staging on top of what's already there.
+# Normal daily runs should leave this False.
 FULL_REFRESH = False
 
 # Table sources are NOT hardcoded here - each table is described by its own
@@ -148,18 +171,15 @@ METADATA_CONTAINER_PATH = "abfss://metadata@<storage-account>.dfs.core.windows.n
 #   delta_path           : abfss:// path to the Delta table root in ADLS Gen2
 #   target_schema        : schema of the target table in the Dedicated SQL Pool
 #   target_table         : name of the target table in the Dedicated SQL Pool
-#   key_columns          : business key column(s) used to detect "already
-#                          loaded" rows. Required. The NOT EXISTS check is
-#                          always NULL-safe, but a key that's actually NULL
-#                          can't uniquely identify a row, so keep these NOT
-#                          NULL in practice.
-#   watermark_column      : optional monotonically increasing column (e.g. a
-#                          modified/inserted timestamp or identity). When set,
-#                          the source read is first pruned to rows greater
-#                          than MAX(watermark_column) currently in the
-#                          target, which is what keeps daily runs fast.
-#                          Without it, the full Delta table is staged and
-#                          de-duped every run.
+#   watermark_column      : monotonically increasing column, assigned once per
+#                          ingestion batch (e.g. a bronze load timestamp).
+#                          This is the *sole* mechanism used to decide
+#                          "already loaded" - there is no business-key check.
+#                          The source read is pruned to rows greater than
+#                          MAX(watermark_column) currently in the target.
+#                          Optional in the profile: defaults to
+#                          DEFAULT_WATERMARK_COLUMN ("_bronze_loaded_at_utc_ts")
+#                          if omitted. Must exist in the source Delta table.
 #   distribution          : optional, "ROUND_ROBIN" (default) or "HASH". Only
 #                          matters when the script has to CREATE the target
 #                          table (i.e. first run). Ignored once the table
@@ -175,6 +195,7 @@ METADATA_CONTAINER_PATH = "abfss://metadata@<storage-account>.dfs.core.windows.n
 # ---- CELL: Imports & setup -------------------------------------------------
 import functools
 import logging
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -182,25 +203,36 @@ from typing import Optional
 
 import yaml
 
-from pyspark.sql import DataFrame, Window
+from pyspark.sql import DataFrame
 from pyspark.sql.types import (
     ArrayType, MapType, StructType, StringType, BooleanType, ByteType,
     ShortType, IntegerType, LongType, FloatType, DoubleType, DecimalType,
     DateType, TimestampType, BinaryType,
 )
-from pyspark.sql.functions import col, lit, row_number, desc
+from pyspark.sql.functions import col, lit
 
 from com.microsoft.spark.sqlanalytics.Constants import Constants
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# Synapse's Livy/Spark driver process typically attaches its own handlers to
+# the root logger before this cell runs, which makes a plain basicConfig()
+# call a silent no-op (by design: it does nothing if the root logger already
+# has handlers). force=True tears those out and installs ours instead, and
+# stream=sys.stdout makes sure it lands in the notebook's visible cell
+# output rather than stderr, which some notebook front-ends don't surface.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 logger = logging.getLogger("delta_to_dw")
 
 spark.conf.set("spark.synapse.linkedService", STAGING_STORAGE_LINKED_SERVICE)
 
 # Below this many source rows, a first-run CREATE TABLE defaults to HEAP
 # rather than CLUSTERED COLUMNSTORE INDEX, per Microsoft's own guidance that
-# columnstore only pays off at larger scale. Override per table via
-# "table_structure" in TABLES if you want something different.
+# columnstore only pays off at larger scale. Override via "table_structure"
+# in that table's YAML profile if you want something different.
 SMALL_TABLE_ROW_THRESHOLD = 5_000_000
 
 # Unique per notebook execution. Used to suffix staging table names so two
@@ -226,16 +258,22 @@ JDBC_URL = (
     "hostNameInCertificate=*.sql.azuresynapse.net;"
     "loginTimeout=30"
 )
-# AAD token audience for Azure SQL / Synapse SQL. mssparkutils is injected
-# automatically into the Synapse notebook runtime - no import needed.
-SQL_TOKEN_AUDIENCE = "https://database.windows.net/"
+# "DW" is mssparkutils' documented audience shorthand for the Dedicated SQL
+# Pool / Synapse SQL resource. mssparkutils is injected automatically into
+# the Synapse notebook runtime - no import needed.
+SQL_TOKEN_AUDIENCE = "DW"
 
 
 # ---- CELL: load table profiles (TABLES) ------------------------------------
 # PyYAML ships with the default Synapse Spark 3.5 runtime; if your pool image
 # doesn't have it, add it as a workspace/session-scoped library
 # (`%pip install pyyaml` for a session-only install).
-REQUIRED_PROFILE_FIELDS = ("delta_path", "target_schema", "target_table", "key_columns")
+REQUIRED_PROFILE_FIELDS = ("delta_path", "target_schema", "target_table")
+
+# Used when a profile doesn't specify watermark_column - a bronze-layer
+# ingestion timestamp, stamped once per load batch, that this script uses as
+# the sole "already loaded" cursor (see sync_table).
+DEFAULT_WATERMARK_COLUMN = "_bronze_loaded_at_utc_ts"
 
 
 def _validate_profile(profile, source_path: str) -> None:
@@ -244,8 +282,6 @@ def _validate_profile(profile, source_path: str) -> None:
     missing = [f for f in REQUIRED_PROFILE_FIELDS if not profile.get(f)]
     if missing:
         raise ValueError(f"Table profile {source_path} is missing required field(s): {missing}")
-    if not isinstance(profile["key_columns"], list) or not profile["key_columns"]:
-        raise ValueError(f"Table profile {source_path}: key_columns must be a non-empty list")
     if profile.get("distribution") == "HASH" and not profile.get("distribution_column"):
         raise ValueError(f"Table profile {source_path}: distribution_column is required when distribution is HASH")
 
@@ -374,7 +410,15 @@ def execute_sql(sql_text: str, timeout_seconds: int = 600) -> int:
 
 @with_retry()
 def query_scalar(sql_text: str, timeout_seconds: int = 60):
-    """Run a SELECT expected to return a single row/column; returns that value or None."""
+    """Run a SELECT expected to return a single row/column; returns that value
+    (as a string) or None. Deliberately uses getString(), not getObject():
+    Py4J auto-converts Java String/Integer/Long/Boolean/Double across the
+    gateway, but NOT java.sql.Timestamp/Date or java.math.BigDecimal - those
+    come back as opaque Java object proxies that PySpark can't use as a
+    literal in a Column expression (e.g. col(x) > max_watermark would break
+    the moment a watermark column is a date/time/decimal type, which is the
+    common case). Getting a string and letting the caller cast it back to
+    the right Spark type sidesteps that entirely."""
     conn = _new_jdbc_connection()
     try:
         stmt = conn.createStatement()
@@ -382,7 +426,7 @@ def query_scalar(sql_text: str, timeout_seconds: int = 60):
             stmt.setQueryTimeout(timeout_seconds)
             rs = stmt.executeQuery(sql_text)
             try:
-                return rs.getObject(1) if rs.next() else None
+                return rs.getString(1) if rs.next() else None
             finally:
                 rs.close()
         finally:
@@ -537,37 +581,6 @@ def align_to_target_columns(df: DataFrame, target_column_defs, table_label: str)
     return df.select(*projected)
 
 
-def deduplicate_candidates(df: DataFrame, key_columns, watermark_column, table_label: str) -> DataFrame:
-    """The NOT EXISTS check only guards against rows already in the target -
-    it says nothing about two rows sharing a key within the same source read
-    (a late correction landing next to the original row, an upstream retry,
-    etc.). Left unhandled, both would pass NOT EXISTS and both get inserted,
-    producing a duplicate in the target. So the candidate batch is always
-    de-duplicated on key_columns before staging: keeping the highest
-    watermark_column value per key when one is configured, otherwise an
-    arbitrary-but-single row per key."""
-    logger.info("[%s] De-duplicating candidate rows on key columns: %s", table_label, key_columns)
-    if watermark_column:
-        window = Window.partitionBy(*[col(c) for c in key_columns]).orderBy(desc(col(watermark_column)))
-        return (
-            df.withColumn("_dedupe_rn", row_number().over(window))
-            .where(col("_dedupe_rn") == 1)
-            .drop("_dedupe_rn")
-        )
-    return df.dropDuplicates(key_columns)
-
-
-def build_null_safe_predicate(key_columns, target_alias="t", staging_alias="s") -> str:
-    parts = []
-    for c in key_columns:
-        ident = quote_ident(c)
-        parts.append(
-            f"(({target_alias}.{ident} = {staging_alias}.{ident}) "
-            f"OR ({target_alias}.{ident} IS NULL AND {staging_alias}.{ident} IS NULL))"
-        )
-    return " AND ".join(parts)
-
-
 # ---- CELL: type mapping + DDL generation (create table / add column) ------
 def spark_type_to_sql_type(spark_type, override: Optional[str] = None) -> str:
     """Deliberate Spark -> Dedicated SQL Pool type mapping, used instead of
@@ -608,6 +621,79 @@ def spark_type_to_sql_type(spark_type, override: Optional[str] = None) -> str:
     )
 
 
+# Dedicated SQL Pool inherits SQL Server's classic per-row byte limit for
+# rowstore structures (HEAP and CLUSTERED INDEX) - it does NOT apply to
+# CLUSTERED COLUMNSTORE INDEX. Defaulting every string column to NVARCHAR(4000)
+# (8000 bytes) means just two or three such columns on a HEAP table can blow
+# past this on their own, and CREATE TABLE/ALTER TABLE ADD fail outright.
+HEAP_MAX_ROW_BYTES = 8060
+# Deliberately conservative allowance for row header, null bitmap, and the
+# variable-length column offset array - the real overhead is smaller, but
+# erring high only ever pushes a borderline table to columnstore instead of
+# HEAP, never the other way around.
+HEAP_ROW_OVERHEAD_BYTES = 100
+
+
+def _sql_type_byte_width(sql_type: str) -> int:
+    """Estimated in-row byte footprint of a SQL Pool column type, for sizing
+    against HEAP_MAX_ROW_BYTES. MAX types are stored off-row (a small
+    pointer in the row), unlike their fixed-length counterparts."""
+    t = sql_type.lower()
+    base = t.split("(")[0]
+
+    def _len_arg():
+        try:
+            inner = t[t.index("(") + 1:t.index(")")]
+            return None if inner == "max" else int(inner)
+        except ValueError:
+            return None
+
+    if base in ("nvarchar", "nchar"):
+        n = _len_arg()
+        return 24 if n is None else 2 * n
+    if base in ("varchar", "char", "varbinary", "binary"):
+        n = _len_arg()
+        return 24 if n is None else n
+    if base == "bigint":
+        return 8
+    if base == "int":
+        return 4
+    if base == "smallint":
+        return 2
+    if base in ("tinyint", "bit"):
+        return 1
+    if base == "real":
+        return 4
+    if base == "float":
+        return 8
+    if base in ("decimal", "numeric"):
+        try:
+            precision = int(t[t.index("(") + 1:t.index(",")])
+        except ValueError:
+            precision = 38
+        if precision <= 9:
+            return 5
+        if precision <= 19:
+            return 9
+        if precision <= 28:
+            return 13
+        return 17
+    if base == "date":
+        return 3
+    if base in ("datetime2", "datetimeoffset", "datetime", "smalldatetime"):
+        return 8
+    return 8000  # unrecognized (e.g. an unusual column_type_overrides value) - assume worst case
+
+
+def estimate_heap_row_bytes(df, column_type_overrides) -> int:
+    overrides = column_type_overrides or {}
+    total = HEAP_ROW_OVERHEAD_BYTES
+    for f in df.schema.fields:
+        sql_type = spark_type_to_sql_type(f.dataType, overrides.get(f.name))
+        total += _sql_type_byte_width(sql_type)
+    return total
+
+
 def sql_type_to_spark_type(sql_type: str):
     """Reverse of spark_type_to_sql_type, best-effort - only used to type a
     NULL placeholder for a target column the source no longer produces."""
@@ -640,14 +726,18 @@ def sql_type_to_spark_type(sql_type: str):
     return StringType()
 
 
-def build_create_table_sql(df, schema, table, key_columns, distribution, distribution_column,
+def build_create_table_sql(df, schema, table, distribution, distribution_column,
                             table_structure, column_type_overrides) -> str:
+    # Every column is created NULLable, even columns whose Spark schema
+    # claims nullable=False - Delta/Parquet nullability metadata is not a
+    # trustworthy guarantee about the actual data, and forcing a stricter
+    # NOT NULL than the source can really promise means a load fails
+    # outright the day a real null shows up.
     overrides = column_type_overrides or {}
     col_defs = []
     for f in df.schema.fields:
         sql_type = spark_type_to_sql_type(f.dataType, overrides.get(f.name))
-        nullability = "NOT NULL" if (f.name in key_columns or not f.nullable) else "NULL"
-        col_defs.append(f"{quote_ident(f.name)} {sql_type} {nullability}")
+        col_defs.append(f"{quote_ident(f.name)} {sql_type} NULL")
     col_defs_sql = ",\n    ".join(col_defs)
 
     if distribution == "HASH":
@@ -688,27 +778,65 @@ def add_missing_columns(schema, table, new_fields, column_type_overrides, table_
     Always added as NULL with no DEFAULT: on Dedicated SQL Pool that keeps
     the ALTER a fast metadata-only operation, whereas a DEFAULT would force a
     full rewrite of every existing row/distribution. Returns the list of
-    (name, sql_type) tuples added, to fold into the caller's column list."""
+    (name, sql_type) tuples added, to fold into the caller's column list.
+
+    Guarded with IF NOT EXISTS: execute_sql retries on transient failure, and
+    if a prior attempt's ALTER actually committed server-side but the client
+    never saw the acknowledgment (e.g. a dropped connection), an unguarded
+    retry would hit "column already exists" instead of quietly no-op'ing."""
     overrides = column_type_overrides or {}
     added = []
     for f in new_fields:
         sql_type = spark_type_to_sql_type(f.dataType, overrides.get(f.name))
         logger.info("[%s] Source has a new column - adding it to the target: %s %s",
                     table_label, f.name, sql_type)
-        execute_sql(f"ALTER TABLE {qualified(schema, table)} ADD {quote_ident(f.name)} {sql_type} NULL")
+        execute_sql(
+            f"IF NOT EXISTS (\n"
+            f"    SELECT 1 FROM sys.columns c JOIN sys.tables t ON c.object_id = t.object_id\n"
+            f"    JOIN sys.schemas s ON t.schema_id = s.schema_id\n"
+            f"    WHERE s.name = '{schema}' AND t.name = '{table}' AND c.name = '{f.name}'\n"
+            f")\n"
+            f"BEGIN\n"
+            f"    ALTER TABLE {qualified(schema, table)} ADD {quote_ident(f.name)} {sql_type} NULL\n"
+            f"END"
+        )
         added.append((f.name, sql_type))
     return added
 
 
 # ---- CELL: bulk data movement in/out of the pool (connector only) ---------
-@with_retry()
-def write_dataframe_to_pool(df: DataFrame, schema: str, table: str, mode: str) -> None:
+def _write_dataframe(df: DataFrame, schema: str, table: str, mode: str) -> None:
     three_part_name = f"{SQL_POOL_DATABASE}.{schema}.{table}"
     (
         df.write.option(Constants.SERVER, SQL_POOL_SERVER)
         .mode(mode)
         .synapsesql(three_part_name)
     )
+
+
+@with_retry()
+def load_target_table_fresh(df: DataFrame, schema: str, table: str) -> None:
+    """First load into a table this run just created. TRUNCATE (idempotent,
+    metadata-only) then append as a single retryable unit: if the append
+    fails partway through and this retries, it must start from a guaranteed-
+    empty table - otherwise the retry would double up whatever the failed
+    attempt already managed to write. There's no business-key check anywhere
+    in this script to catch that after the fact, so this has to hold on its
+    own."""
+    execute_sql(f"TRUNCATE TABLE {qualified(schema, table)}")
+    _write_dataframe(df, schema, table, mode="append")
+
+
+@with_retry()
+def load_staging_table(df: DataFrame, schema: str, table: str, column_defs) -> None:
+    """Same reasoning as load_target_table_fresh, for the disposable staging
+    table: drop-if-exists + create + append as one retryable unit, so a
+    retry after a partial write failure can't double-insert into staging -
+    which would otherwise commit straight into the target as real duplicate
+    rows, since the final INSERT has no de-dup predicate of its own."""
+    execute_sql(f"IF OBJECT_ID('{schema}.{table}', 'U') IS NOT NULL DROP TABLE {qualified(schema, table)}")
+    execute_sql(build_staging_table_sql(schema, table, column_defs))
+    _write_dataframe(df, schema, table, mode="append")
 
 
 # ---- CELL: per-table sync --------------------------------------------------
@@ -724,8 +852,7 @@ class SyncResult:
 def sync_table(conf: dict) -> SyncResult:
     target_schema = conf["target_schema"]
     target_table = conf["target_table"]
-    key_columns = conf["key_columns"]
-    watermark_column = conf.get("watermark_column")
+    watermark_column = conf.get("watermark_column") or DEFAULT_WATERMARK_COLUMN
     delta_path = conf["delta_path"]
     column_type_overrides = conf.get("column_type_overrides")
     label = f"{target_schema}.{target_table}"
@@ -734,30 +861,67 @@ def sync_table(conf: dict) -> SyncResult:
     staging_table_prefix = f"{target_table}{STAGING_TABLE_SUFFIX}"
     staging_table = f"{staging_table_prefix}_{RUN_ID}"
 
-    if not key_columns:
-        raise ValueError(f"[{label}] key_columns is required")
-
     df = spark.read.format("delta").load(delta_path)
     assert_supported_schema(df, label)
+
+    # watermark_column is the only mechanism left for deciding "already
+    # loaded" - unlike an ordinary column, it can't be allowed to quietly
+    # NULL-fill if the source stops producing it (see align_to_target_columns
+    # for how that's handled for every other column), so it's checked here,
+    # before anything else, with a hard failure.
+    if watermark_column.lower() not in {c.lower() for c in df.columns}:
+        raise ValueError(
+            f"[{label}] watermark_column '{watermark_column}' was not found in the source Delta "
+            f"table - it's required (there is no business-key fallback for detecting new rows)."
+        )
 
     target_column_defs = query_target_column_defs(target_schema, target_table)
 
     # --- Bootstrap: target table doesn't exist yet -> create + one-shot load
     if not target_column_defs:
         row_count = df.count()
-        structure = conf.get("table_structure") or (
-            "HEAP" if row_count < SMALL_TABLE_ROW_THRESHOLD else "CLUSTERED COLUMNSTORE INDEX"
-        )
+        estimated_row_bytes = estimate_heap_row_bytes(df, column_type_overrides)
+        explicit_structure = conf.get("table_structure")
+        if explicit_structure:
+            structure = explicit_structure
+            if structure == "HEAP" and estimated_row_bytes > HEAP_MAX_ROW_BYTES:
+                logger.warning(
+                    "[%s] table_structure is explicitly HEAP but the estimated row width "
+                    "(~%d bytes) exceeds Dedicated SQL Pool's %d-byte HEAP row limit - "
+                    "CREATE TABLE will likely fail. Consider CLUSTERED COLUMNSTORE INDEX or "
+                    "narrowing column_type_overrides.",
+                    label, estimated_row_bytes, HEAP_MAX_ROW_BYTES,
+                )
+        elif row_count < SMALL_TABLE_ROW_THRESHOLD and estimated_row_bytes <= HEAP_MAX_ROW_BYTES:
+            structure = "HEAP"
+        else:
+            structure = "CLUSTERED COLUMNSTORE INDEX"
+            if row_count < SMALL_TABLE_ROW_THRESHOLD:
+                logger.info(
+                    "[%s] Using CLUSTERED COLUMNSTORE INDEX despite row count (%d) being under "
+                    "the small-table threshold - estimated row width (~%d bytes) would exceed "
+                    "Dedicated SQL Pool's %d-byte HEAP row limit.",
+                    label, row_count, estimated_row_bytes, HEAP_MAX_ROW_BYTES,
+                )
         create_ddl = build_create_table_sql(
-            df, target_schema, target_table, key_columns,
+            df, target_schema, target_table,
             conf.get("distribution", "ROUND_ROBIN"), conf.get("distribution_column"),
             structure, column_type_overrides,
         )
         logger.info("[%s] Target table not found - creating it:\n%s", label, create_ddl)
-        execute_sql(create_ddl)
+        # Guarded with IF NOT EXISTS: if a prior attempt's CREATE committed
+        # server-side but execute_sql's own retry never saw the ack, a
+        # retry here must no-op instead of failing on "already exists".
+        execute_sql(
+            f"IF NOT EXISTS (\n"
+            f"    SELECT 1 FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id\n"
+            f"    WHERE s.name = '{target_schema}' AND t.name = '{target_table}'\n"
+            f")\n"
+            f"BEGIN\n{create_ddl}\nEND"
+        )
         if row_count == 0:
             return SyncResult(label, "CREATED_EMPTY", detail="target table created; source has no rows yet")
-        write_dataframe_to_pool(df, target_schema, target_table, mode="append")
+        load_target_table_fresh(df, target_schema, target_table)
         logger.info("[%s] Bootstrap load complete: %d rows.", label, row_count)
         return SyncResult(label, "BOOTSTRAPPED", rows_candidate=row_count, rows_inserted=row_count)
 
@@ -774,47 +938,58 @@ def sync_table(conf: dict) -> SyncResult:
     df = align_to_target_columns(df, target_column_defs, label)
     target_columns = [name for name, _ in target_column_defs]
 
-    # --- Narrow the source read with the watermark, when available --------
-    if watermark_column and not FULL_REFRESH:
+    # --- Narrow the source read to rows not yet loaded, per the watermark --
+    if FULL_REFRESH:
+        logger.warning(
+            "[%s] FULL_REFRESH is set - truncating the target and reloading the entire source "
+            "(there's no business key to de-dup against, so this can't just re-stage on top).",
+            label,
+        )
+        execute_sql(f"TRUNCATE TABLE {qualified(target_schema, target_table)}")
+    else:
         max_watermark = query_scalar(
             f"SELECT MAX({quote_ident(watermark_column)}) FROM {qualified(target_schema, target_table)}"
         )
         if max_watermark is not None:
-            df = df.where(col(watermark_column) > max_watermark)
+            watermark_type = dict((f.name, f.dataType) for f in df.schema.fields)[watermark_column]
+            df = df.where(col(watermark_column) > lit(max_watermark).cast(watermark_type))
             logger.info("[%s] Watermark filter: %s > %s", label, watermark_column, max_watermark)
 
     candidate_count = df.limit(1).count()
     if candidate_count == 0:
         return SyncResult(label, "SKIPPED", detail="no candidate rows after watermark filter")
 
-    df = deduplicate_candidates(df, key_columns, watermark_column, label)
     candidate_count = df.count()
-    logger.info("[%s] %d candidate row(s) to stage (post de-dup).", label, candidate_count)
+    logger.info("[%s] %d candidate row(s) to stage.", label, candidate_count)
 
     try:
-        for stale_name in find_stale_staging_tables(staging_schema, f"{staging_table_prefix}_%", STALE_STAGING_TABLE_HOURS):
+        # Best-effort housekeeping only - must never fail the actual sync.
+        try:
+            stale_names = find_stale_staging_tables(
+                staging_schema, f"{staging_table_prefix}_%", STALE_STAGING_TABLE_HOURS
+            )
+        except Exception as lookup_exc:
+            logger.warning("[%s] Could not look up orphaned staging tables: %s", label, lookup_exc)
+            stale_names = []
+        for stale_name in stale_names:
             try:
                 execute_sql(f"DROP TABLE {qualified(staging_schema, stale_name)}")
                 logger.info("[%s] Dropped orphaned staging table from a previous run: %s", label, stale_name)
             except Exception as stale_exc:
                 logger.warning("[%s] Could not drop orphaned staging table %s: %s", label, stale_name, stale_exc)
 
-        execute_sql(build_staging_table_sql(staging_schema, staging_table, target_column_defs))
-        write_dataframe_to_pool(df, staging_schema, staging_table, mode="append")
+        load_staging_table(df, staging_schema, staging_table, target_column_defs)
 
+        # No WHERE clause: the watermark filter above (or the FULL_REFRESH
+        # truncate) already guarantees everything staged here is new -
+        # there's no business key to re-check against on the way in.
         col_list = ", ".join(quote_ident(c) for c in target_columns)
-        predicate = build_null_safe_predicate(key_columns)
         insert_sql = (
             f"INSERT INTO {qualified(target_schema, target_table)} ({col_list})\n"
-            f"SELECT {col_list} FROM {qualified(staging_schema, staging_table)} AS s\n"
-            f"WHERE NOT EXISTS (\n"
-            f"    SELECT 1 FROM {qualified(target_schema, target_table)} AS t\n"
-            f"    WHERE {predicate}\n"
-            f")"
+            f"SELECT {col_list} FROM {qualified(staging_schema, staging_table)}"
         )
         inserted = execute_sql(insert_sql, timeout_seconds=1800)
-        logger.info("[%s] Inserted %d new row(s) (%d candidates, %d already present).",
-                    label, inserted, candidate_count, candidate_count - inserted)
+        logger.info("[%s] Inserted %d new row(s).", label, inserted)
         return SyncResult(label, "OK", rows_candidate=candidate_count, rows_inserted=inserted)
     finally:
         try:
