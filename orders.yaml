@@ -7,14 +7,13 @@ delta_path: "abfss://raw@<storage-account>.dfs.core.windows.net/sales/orders"
 target_schema: dbo
 target_table: Orders
 
-# Business key(s) used to detect rows already loaded. Required.
-key_columns:
-  - OrderId
-
-# Optional monotonically increasing column. When set, daily runs only read
-# rows newer than MAX(watermark_column) already in the target - this is what
-# keeps a large, frequently-updated table fast to sync every day.
-watermark_column: ModifiedDateUtc
+# "Already loaded" is decided purely by this watermark, not a business key:
+# daily runs only read rows newer than MAX(watermark_column) already in the
+# target. Omit this field entirely to use the default, _bronze_loaded_at_utc_ts
+# - only set it explicitly if this table's bronze ingestion timestamp column
+# is named something else. Must be assigned once, atomically, per ingestion
+# batch (never changes afterward) for the incremental logic to be correct.
+watermark_column: _bronze_loaded_at_utc_ts
 
 # Only used the first time this table is created in the pool.
 distribution: HASH
