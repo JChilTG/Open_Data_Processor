@@ -1,0 +1,73 @@
+version: 2
+
+seeds:
+  - name: seed_country_codes
+    description: >
+      Canonical, hand-maintained master list of countries. This is the single source of
+      truth every conformed country key in the warehouse resolves to. Includes an
+      explicit `UNKNOWN` row so fact tables can carry a real dimension key even when a
+      source record's country can't be resolved, instead of a dangling null.
+    config:
+      column_types:
+        country_iso2: varchar(2)
+        country_iso3: varchar(3)
+    columns:
+      - name: country_iso2
+        description: ISO 3166-1 alpha-2 code.
+      - name: country_iso3
+        description: ISO 3166-1 alpha-3 code. This is the canonical key used everywhere downstream.
+        tests: [not_null, unique]
+      - name: country_name
+        description: Canonical display name.
+      - name: region
+        description: Coarse geographic grouping used for reporting rollups.
+
+  - name: seed_country_aliases
+    description: >
+      Known non-obvious raw values that don't match seed_country_codes' own columns
+      directly (ISO numeric codes, historical/informal names, common misspellings).
+      Global — not scoped to a source system — because these are standard, source-
+      independent facts about how a country can be written, not source-specific data
+      quirks (those belong in seed_country_overrides instead).
+    columns:
+      - name: alias_value
+        description: Raw text/code as it might appear in any source.
+        tests: [not_null]
+      - name: country_iso3
+        description: The canonical key this alias resolves to.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('seed_country_codes')
+                field: country_iso3
+
+  - name: seed_country_overrides
+    description: >
+      Manual, human-curated corrections. Highest precedence input in the conforming
+      macro — use this to fix a specific source's specific bad data without touching the
+      generic alias table. Every row must be justified with a `reason` so a future
+      modeler can tell why an override exists before removing it.
+    columns:
+      - name: source_system
+        description: >
+          Source system this override applies to, or null to apply globally
+          (lower precedence than a source-specific override for the same raw_value).
+      - name: raw_value
+        description: Raw text/code as it appears in that source.
+        tests: [not_null]
+      - name: country_iso3
+        description: The canonical key this raw value should resolve to.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('seed_country_codes')
+                field: country_iso3
+      - name: reason
+        description: Why this override exists. Required for every row — this is a review-blocking field, not optional documentation.
+        tests: [not_null]
+      - name: updated_by
+        description: Person who added/last changed this row.
+      - name: updated_at
+        description: Date this override was added/last changed.

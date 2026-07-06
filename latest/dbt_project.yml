@@ -1,0 +1,61 @@
+
+# Reference implementation of the conformed-dimension framework described in
+# 08-conformed-dimension-framework.md. Written specifically for Synapse dedicated SQL
+# pool. Point a Synapse profile at a dev/UAT pool and `dbt seed && dbt run && dbt test`
+# to see the pattern work end to end (see models/intermediate/conformed/country/examples/),
+# then copy the macro + vars structure into your real warehouse project.
+
+name: 'dbt_guides_reference'
+version: '1.0.0'
+config-version: 2
+
+profile: 'dbt_guides_reference'
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Central, self-documenting registry of every conformed dimension in the warehouse.
+# Adding a new dimension type (currency, product category, ...) means adding three
+# seeds following the naming pattern below and one entry here — nothing in the macro
+# needs to change. See 08-conformed-dimension-framework.md.
+vars:
+  conformed_dimensions:
+    country:
+      codes_seed: seed_country_codes           # canonical master list
+      aliases_seed: seed_country_aliases        # known non-obvious raw values -> canonical key
+      overrides_seed: seed_country_overrides    # manual, human-curated corrections
+      canonical_key: country_iso3
+      match_columns: ['country_iso2', 'country_iso3', 'country_name']
+      unknown_value: 'UNKNOWN'
+
+  # Which profile target counts as "production" for macros/generate_schema_name.sql.
+  # Change this if your profile's prod target is named something else.
+  prod_target_name: 'prod'
+
+seeds:
+  dbt_guides_reference:
+    +quote_columns: false
+
+models:
+  dbt_guides_reference:
+    intermediate:
+      +materialized: view
+      +schema: intermediate
+    marts:
+      # No marts models exist in this reference repo yet (see 04-marts-layer.md) — this
+      # is the documented default for when they're added: physical tables, a clean
+      # `marts` schema in prod (dev/CI runs get it prefixed with their own schema, see
+      # generate_schema_name.sql), and automatic whole-table statistics on every build
+      # so nobody has to remember to add the post_hook by hand. A model needing
+      # targeted column-level stats instead can set its own `post_hook` — see
+      # macros/update_statistics.sql for that pattern.
+      +materialized: table
+      +schema: marts
+      +post-hook: "{{ update_statistics() }}"
