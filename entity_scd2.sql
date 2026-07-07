@@ -42,6 +42,15 @@
 -- the detect_deletions config; it's only ever set to 1 when that's turned on.
 -- detect_deletions is a per-model config (set above), not a project var: it
 -- lives in this file so each SCD2 model can turn it on/off independently.
+--
+-- The incremental branch seeds a LAG timeline with each entity's last known
+-- state (see `timeline`/`change_flags` below) rather than comparing each new
+-- row straight to that pre-batch state. This matters whenever a run ingests
+-- more than one new _landing_extract_date at once (e.g. catching up after a
+-- missed day): without the seeded timeline, two new dates in the same run
+-- are only ever compared against the state from before the run started, so a
+-- real transition between those two new dates (e.g. a value changes then
+-- reverts) can be silently dropped.
 
 {% if config.get('detect_deletions', false) %}
 {% set attr_cols = attribute_columns(source('raw', 'system_snapshot_history')) %}
@@ -61,49 +70,102 @@ with source_rows as (
 
 {% if is_incremental() %}
 
--- Daily run: only the newest snapshot rows are in source_rows above. Compare
--- each one to the last version already stored for that entity (found via a
--- self-join on this HASH(entity_id)-distributed table, not a full history scan).
+-- Latest known row per entity -- seeds the LAG timeline below, and (when
+-- detect_deletions is on) is also the carry-forward source for a deletion
+-- marker's attribute values. One scan of {{ this }}, reused for both.
 , last_known as (
-
-    select entity_id, attribute_hash as prev_attribute_hash, is_deleted as prev_is_deleted
-    from (
-        select
-            entity_id,
-            attribute_hash,
-            is_deleted,
-            row_number() over (partition by entity_id order by _landing_extract_date desc) as rn
-        from {{ this }}
-    ) ranked
-    where rn = 1
-
-)
-
-{% if config.get('detect_deletions', false) %}
--- Full last-known row (not just the hash) so a deletion marker can carry
--- forward whatever attribute values the entity last had.
-, last_known_full as (
 
     select *
     from (
         select *, row_number() over (partition by entity_id order by _landing_extract_date desc) as rn
         from {{ this }}
     ) ranked
-    where rn = 1 and is_deleted = 0
+    where rn = 1
+
+)
+
+-- Seed each entity's timeline with its last known state so a run that
+-- ingests more than one new snapshot date at once (e.g. catching up after a
+-- missed day) still detects every real transition between those dates --
+-- not just a comparison against the state from before this run started.
+-- source_rows is already filtered to dates after last_known's date, so
+-- ordering the combined timeline by date is safe.
+, timeline as (
+
+    select entity_id, _landing_extract_date, attribute_hash, is_deleted, 0 as is_new
+    from last_known
+
+    union all
+
+    select entity_id, _landing_extract_date, attribute_hash, 0 as is_deleted, 1 as is_new
+    from source_rows
+
+)
+
+, change_flags as (
+
+    select
+        entity_id,
+        _landing_extract_date,
+        is_new,
+        lag(attribute_hash) over (partition by entity_id order by _landing_extract_date) as prev_attribute_hash,
+        lag(is_deleted) over (partition by entity_id order by _landing_extract_date) as prev_is_deleted
+    from timeline
+
+)
+
+{% if config.get('detect_deletions', false) %}
+-- Same calendar-gap approach as the bootstrap branch below, but the calendar
+-- is just this run's new dates, and the timeline being checked for gaps
+-- starts from the seed row -- so an entity absent from the whole batch, and
+-- one that appears mid-batch then vanishes before the batch's last date, are
+-- both caught the same way.
+, calendar_dates as (
+
+    select distinct _landing_extract_date from source_rows
+
+)
+
+, calendar_next as (
+
+    select
+        _landing_extract_date,
+        lead(_landing_extract_date) over (order by _landing_extract_date) as next_calendar_date
+    from calendar_dates
+
+)
+
+, entity_last_seen as (
+
+    select
+        entity_id,
+        _landing_extract_date,
+        is_deleted,
+        lead(_landing_extract_date) over (partition by entity_id order by _landing_extract_date) as next_present_date
+    from timeline
 
 )
 
 , disappeared as (
 
     select
-        lkf.entity_id,
-        (select max(_landing_extract_date) from source_rows) as _landing_extract_date,
+        els.entity_id,
+        cn.next_calendar_date as _landing_extract_date,
         cast(null as varchar(64)) as attribute_hash, -- TODO: match this cast to attribute_hash's real data type
-        {{ column_list(attr_cols, 'lkf') }},
+        {% for col in attr_cols -%}
+        coalesce(sr.{{ col }}, lk.{{ col }}){{ ", " if not loop.last }}
+        {% endfor -%},
         1 as is_deleted
-    from last_known_full lkf
-    left join source_rows s on s.entity_id = lkf.entity_id
-    where s.entity_id is null
+    from entity_last_seen els
+    join calendar_next cn on cn._landing_extract_date = els._landing_extract_date
+    left join source_rows sr
+        on sr.entity_id = els.entity_id and sr._landing_extract_date = els._landing_extract_date
+    left join last_known lk
+        on lk.entity_id = els.entity_id
+    where cn.next_calendar_date is not null
+      and (els.next_present_date is null or els.next_present_date > cn.next_calendar_date)
+      and els.is_deleted = 0
+      and exists (select 1 from source_rows) -- belt-and-suspenders: an empty daily batch must never look like "everyone disappeared" (the calendar_next join above already guarantees this, since calendar_dates is empty when source_rows is)
 
 )
 
@@ -111,11 +173,15 @@ select
     {{ column_list(all_cols, 's') }},
     0 as is_deleted
 from source_rows s
-left join last_known lk
-    on s.entity_id = lk.entity_id
-where lk.entity_id is null                      -- brand new entity
-   or lk.prev_is_deleted = 1                     -- reappeared after being marked deleted
-   or s.attribute_hash <> lk.prev_attribute_hash -- changed since last known version
+join change_flags cf
+    on s.entity_id = cf.entity_id
+   and s._landing_extract_date = cf._landing_extract_date
+where cf.is_new = 1
+  and (
+    cf.prev_attribute_hash is null       -- brand new entity
+    or cf.prev_is_deleted = 1            -- reappeared after being marked deleted
+    or s.attribute_hash <> cf.prev_attribute_hash -- changed since the previous version in this timeline
+  )
 
 union all
 select * from disappeared
@@ -124,11 +190,15 @@ select * from disappeared
 
 select s.*, 0 as is_deleted
 from source_rows s
-left join last_known lk
-    on s.entity_id = lk.entity_id
-where lk.entity_id is null                      -- brand new entity
-   or lk.prev_is_deleted = 1                     -- reappeared after being marked deleted
-   or s.attribute_hash <> lk.prev_attribute_hash -- changed since last known version
+join change_flags cf
+    on s.entity_id = cf.entity_id
+   and s._landing_extract_date = cf._landing_extract_date
+where cf.is_new = 1
+  and (
+    cf.prev_attribute_hash is null       -- brand new entity
+    or cf.prev_is_deleted = 1            -- reappeared after being marked deleted
+    or s.attribute_hash <> cf.prev_attribute_hash -- changed since the previous version in this timeline
+  )
 
 {% endif %}
 
