@@ -1,8 +1,0 @@
-override_type,source_system,match_field,source_value,canonical_iso3,canonical_name
-source_map,AS,name,South Korea,KOR,
-source_map,AS,name,Republic of Korea,KOR,
-source_map,AS,name,Czech Republic,CZE,
-source_map,AF,iso2,UK,GBR,
-source_map,AF,iso2,EL,GRC,
-canonical_name,,,,TUR,Turkey
-canonical_name,,,,MMR,Myanmar (Burma)

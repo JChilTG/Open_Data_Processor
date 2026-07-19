@@ -1,7 +1,0 @@
-source_value,canonical_value,source_system
-Male,M,hr_system
-Female,F,hr_system
-Non-Binary,X,hr_system
-MALE,M,legacy
-FEMALE,F,legacy
-Unknown,U,hr_system

@@ -1,3 +1,0 @@
-source_system,raw_value,country_iso3,reason,updated_by,updated_at
-demo_source,LEGACY-FR,FRA,Legacy region code used by demo_source before its 2024 migration; not a real ISO value so it can never be auto-matched or aliased generically,jane.doe,2026-01-15
-,UNMAPPED,UNKNOWN,Explicit placeholder some sources write when a rep leaves the country field blank in their own UI,jane.doe,2026-01-15
