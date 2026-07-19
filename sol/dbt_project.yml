@@ -1,0 +1,28 @@
+name: conform_demo
+version: 1.0.0
+config-version: 2
+profile: conform_demo
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+analysis-paths: ["analyses"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+seeds:
+  conform_demo:
+    +quote_columns: false
+
+models:
+  conform_demo:
+    +materialized: view
+    dimensions:
+      +materialized: table
+    staging:
+      +materialized: table
+    lookups:
+      +materialized: table
+    marts:
+      +materialized: table

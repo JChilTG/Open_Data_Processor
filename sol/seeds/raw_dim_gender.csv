@@ -1,0 +1,5 @@
+gender_sk,gender_code,gender_name
+1,M,Male
+2,F,Female
+3,X,Non-binary
+4,U,Unknown

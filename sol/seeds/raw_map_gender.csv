@@ -1,0 +1,9 @@
+source_system,source_value,canonical_value
+ACE,M,M
+ACE,Male,M
+ACE,F,F
+ACE,Female,F
+HRIS,1,M
+HRIS,2,F
+HRIS,3,X
+HRIS,9,U

@@ -1,0 +1,109 @@
+version: 2
+
+models:
+  - name: lkp_gender
+    description: >
+      Pre-materialized gender conformance lookup. One row per source-system
+      + source-value key, joined to the canonical gender dimension.
+    columns:
+      - name: conform_key
+        description: SHA-256 binary key of normalized source_system + source_value.
+        data_tests:
+          - not_null
+          - unique
+      - name: gender_sk
+        data_tests:
+          - not_null
+      - name: gender_name
+        data_tests:
+          - not_null
+      - name: conform_candidate_count
+        description: How many dimension rows competed for this key before dedupe.
+    data_tests:
+      - conform_lookup_unambiguous
+
+  - name: stg_employee
+    description: Employee staging with a persisted gender_conform_key.
+    columns:
+      - name: employee_id
+        data_tests:
+          - not_null
+          - unique
+      - name: gender_conform_key
+        description: >
+          Persisted conform key. Null when raw_gender or source_system is blank.
+
+  - name: fct_employee
+    description: >
+      Employee fact with gender attributes via conform_join. Both gender_sk and
+      gender_name reuse a single left join to lkp_gender.
+    columns:
+      - name: employee_id
+        data_tests:
+          - not_null
+          - unique
+      - name: gender_sk
+        description: Canonical gender surrogate key; -1 when unmapped.
+      - name: gender_name
+        description: Canonical gender name; UNKNOWN when unmapped.
+
+  - name: lkp_country
+    description: >
+      Pre-materialized country conformance lookup. ABF alpha-2 codes and ABS
+      country names share this table; keys are scoped by source_system.
+    columns:
+      - name: conform_key
+        data_tests:
+          - not_null
+          - unique
+      - name: country_sk
+        data_tests:
+          - not_null
+      - name: alpha2
+        data_tests:
+          - not_null
+      - name: country_name
+        data_tests:
+          - not_null
+    data_tests:
+      - conform_lookup_unambiguous
+
+  - name: stg_abf
+    description: ABF shipments with alpha-2 codes and a persisted country_conform_key.
+    columns:
+      - name: shipment_id
+        data_tests:
+          - not_null
+          - unique
+      - name: country_conform_key
+        description: SHA-256 of normalized ABF + alpha2_country.
+
+  - name: stg_abs
+    description: ABS orders with country names and a persisted country_conform_key.
+    columns:
+      - name: order_id
+        data_tests:
+          - not_null
+          - unique
+      - name: country_conform_key
+        description: SHA-256 of normalized ABS + country_name.
+
+  - name: fct_abf_shipment
+    description: ABF shipment fact; country_sk is the only country attribute retained.
+    columns:
+      - name: shipment_id
+        data_tests:
+          - not_null
+          - unique
+      - name: country_sk
+        description: Canonical country surrogate key; -1 when unmapped.
+
+  - name: fct_abs_order
+    description: ABS order fact; same country_sk grain as fct_abf_shipment.
+    columns:
+      - name: order_id
+        data_tests:
+          - not_null
+          - unique
+      - name: country_sk
+        description: Canonical country surrogate key; -1 when unmapped.

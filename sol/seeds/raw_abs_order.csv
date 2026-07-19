@@ -1,0 +1,8 @@
+order_id,country_name,ordered_at,amount
+B2001,Australia,2024-02-01,150.00
+B2002,United States,2024-02-02,220.50
+B2003,United States of America,2024-02-03,99.00
+B2004,United Kingdom,2024-02-04,310.00
+B2005,japan,2024-02-05,45.25
+B2006,Atlantis,2024-02-06,10.00
+B2007,,2024-02-07,0.00

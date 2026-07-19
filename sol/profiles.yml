@@ -1,0 +1,8 @@
+conform_demo:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: conform_demo.duckdb
+      threads: 4
+      schema: main
